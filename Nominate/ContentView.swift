@@ -1,8 +1,8 @@
-import Ollama
 import PDFKit
 import QuickLookUI
 import SwiftUI
 import UniformTypeIdentifiers
+import Vision
 
 struct PDFFile: Identifiable {
     let id = UUID()
@@ -14,8 +14,16 @@ struct PDFFile: Identifiable {
 }
 
 struct ContentView: View {
-    @StateObject private var viewModel = ContentViewModel()
+    @StateObject private var templateStore: TemplateStore
+    @StateObject private var viewModel: ContentViewModel
     @State private var isTargeted = false
+    @State private var showingTemplateEditor = false
+
+    init() {
+        let store = TemplateStore()
+        _templateStore = StateObject(wrappedValue: store)
+        _viewModel = StateObject(wrappedValue: ContentViewModel(templateStore: store))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,6 +32,7 @@ struct ContentView: View {
             } else {
                 fileList
             }
+            namingSection
             bottomBar
         }
         .frame(minWidth: 400, minHeight: 300)
@@ -46,6 +55,44 @@ struct ContentView: View {
                 dismissButton: .default(Text("OK"))
             )
         }
+        .sheet(isPresented: $showingTemplateEditor) {
+            TemplateEditorView(store: templateStore)
+        }
+    }
+
+    private var namingSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Filename format")
+                    .foregroundColor(.secondary)
+                Picker("", selection: $templateStore.selectedTemplateID) {
+                    ForEach(templateStore.templates) { template in
+                        Text(template.name).tag(template.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 200)
+
+                Button(action: { showingTemplateEditor = true }) {
+                    Image(systemName: "gearshape.fill")
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.accentColor)
+
+                Spacer()
+            }
+
+            Text(
+                "e.g. "
+                    + renderedExample(
+                        format: templateStore.selectedTemplate.format,
+                        customVariables: templateStore.customVariables) + ".pdf"
+            )
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        .padding(.horizontal)
+        .padding(.top, 8)
     }
 
     private var dropZone: some View {
@@ -119,11 +166,13 @@ struct ContentView: View {
                 Image(systemName: "eye")
             }
             .buttonStyle(.plain)
+            .foregroundColor(.accentColor)
 
             Button(action: { viewModel.openInFinder(file) }) {
-                Image(systemName: "magnifyingglass")
+                Image(systemName: "folder")
             }
             .buttonStyle(.plain)
+            .foregroundColor(.accentColor)
         }
     }
 
@@ -133,12 +182,7 @@ struct ContentView: View {
                 Image(systemName: "plus")
             }
             .buttonStyle(.plain)
-
-            Spacer()
-
-            Text("Drag and drop PDF files onto the area above")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            .foregroundColor(.accentColor)
 
             Spacer()
         }
@@ -149,11 +193,16 @@ struct ContentView: View {
 
 class ContentViewModel: ObservableObject {
     @Published var pdfFiles: [PDFFile] = []
-    private let client: Ollama.Client = .default
+    private let client: AppleIntelligenceClient = .default
+    private let templateStore: TemplateStore
     private var processingQueue: [PDFFile] = []
     private var isProcessing = false
     @Published var alertItem: AlertItem?
     private var quickLookDataSource: QuickLookDataSource?
+
+    init(templateStore: TemplateStore) {
+        self.templateStore = templateStore
+    }
 
     func handleDrop(providers: [NSItemProvider]) -> Bool {
         for provider in providers {
@@ -196,17 +245,16 @@ class ContentViewModel: ObservableObject {
             pdfFiles[index].progress = 0
 
             do {
-                let contents = try extractPDFContents(from: file.url)
-                pdfFiles[index].progress = 0.25
+                let contents = try await extractPDFContents(from: file.url)
+                pdfFiles[index].progress = 0.3
 
-                let date = try await extractDate(from: contents, using: client)
-                pdfFiles[index].progress = 0.5
+                let values = try await extractVariables(
+                    from: contents, variables: templateStore.allVariables, using: client)
+                pdfFiles[index].progress = 0.8
 
-                let summary = try await generateSummary(of: contents, using: client)
-                pdfFiles[index].progress = 0.75
-
-                let filename = try await generateFilename(
-                    for: summary, date: date, extension: file.url.pathExtension, with: client)
+                let filename = renderFilename(
+                    template: templateStore.selectedTemplate, values: values,
+                    extension: file.url.pathExtension)
                 pdfFiles[index].generatedFilename = filename
                 pdfFiles[index].isProcessed = true
                 pdfFiles[index].progress = 1.0
@@ -286,16 +334,59 @@ class ContentViewModel: ObservableObject {
         }
     }
 
-    private func extractPDFContents(from url: URL) throws -> String {
+    /// Extracts text from a PDF, falling back to on-device OCR for scanned pages
+    /// (e.g. phone photos or faxes) that have no embedded text layer.
+    private func extractPDFContents(from url: URL) async throws -> String {
         guard let pdfDocument = PDFDocument(url: url) else {
             throw NSError(
                 domain: "PDFError", code: 0,
                 userInfo: [NSLocalizedDescriptionKey: "Unable to open PDF document."])
         }
 
-        return (0..<pdfDocument.pageCount)
-            .compactMap { pdfDocument.page(at: $0)?.string }
-            .joined()
+        return await Task.detached(priority: .userInitiated) {
+            (0..<pdfDocument.pageCount).compactMap { pageIndex -> String? in
+                guard let page = pdfDocument.page(at: pageIndex) else { return nil }
+
+                // Always OCR in addition to any embedded text layer: some PDFs (e.g. an
+                // exported photo) carry a scanned page's real content purely as an image,
+                // but still have a trivial bit of embedded text (like a caption or
+                // timestamp annotation) that would otherwise make us skip OCR entirely.
+                var pieces: [String] = []
+                if let text = page.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !text.isEmpty
+                {
+                    pieces.append(text)
+                }
+                if let ocrText = try? Self.recognizedText(from: page),
+                    !ocrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    pieces.append(ocrText)
+                }
+
+                return pieces.isEmpty ? nil : pieces.joined(separator: "\n")
+            }.joined()
+        }.value
+    }
+
+    private static func recognizedText(from page: PDFPage) throws -> String {
+        let bounds = page.bounds(for: .mediaBox)
+        let scale: CGFloat = 3
+        let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        let image = page.thumbnail(of: size, for: .mediaBox)
+
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return ""
+        }
+
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+
+        try VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+
+        return (request.results ?? [])
+            .compactMap { $0.topCandidates(1).first?.string }
+            .joined(separator: "\n")
     }
 }
 
